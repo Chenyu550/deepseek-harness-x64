@@ -1,0 +1,91 @@
+name: Package DSH for Intel Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: DeepSeek Harness release tag
+        required: true
+        default: dsh-v0.2.2-rc.5
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out the official release
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: refs/tags/${{ inputs.upstream_tag }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Use the official macOS bundle identifier
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/desktop/scripts/desktop-package-environment.mjs")
+          source = path.read_text(encoding="utf-8")
+          local_id = "DSH_DESKTOP_APP_ID: 'com.deepseek.harness',"
+          official_id = "DSH_DESKTOP_APP_ID: 'com.deepseek.dsh',"
+          if source.count(local_id) == 1 and official_id not in source:
+              path.write_text(source.replace(local_id, official_id), encoding="utf-8")
+          elif source.count(official_id) != 1 or local_id in source:
+              raise SystemExit("The upstream unsigned bundle ID configuration changed.")
+          PY
+          git diff --check
+
+      - name: Build the Intel DMG
+        run: |
+          test "$(uname -m)" = x86_64
+          pnpm install --frozen-lockfile
+          pnpm run package:desktop:mac:x64:unsigned --check
+          pnpm run package:desktop:mac:x64:unsigned
+
+      - name: Verify the app and record the DMG checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts
+          shopt -s nullglob
+          images=(*-mac-x64-unsigned.dmg)
+          if [[ "${#images[@]}" != 1 ]]; then
+            echo "Expected a single unsigned Intel DMG." >&2
+            exit 1
+          fi
+          mount_dir=$(mktemp -d "$RUNNER_TEMP/dsh-mount.XXXXXX")
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir"' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${images[0]}"
+          app="$mount_dir/DeepSeek Harness.app"
+          plist="$app/Contents/Info.plist"
+          bundle_id=$(plutil -extract CFBundleIdentifier raw -o - "$plist")
+          executable=$(plutil -extract CFBundleExecutable raw -o - "$plist")
+          architecture=$(lipo -archs "$app/Contents/MacOS/$executable")
+          version=$(plutil -extract CFBundleShortVersionString raw -o - "$plist")
+          printf 'App %s, bundle ID %s, architecture %s, version %s\n' "${app##*/}" "$bundle_id" "$architecture" "$version" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$bundle_id" = com.deepseek.dsh
+          test "$executable" = "DeepSeek Harness"
+          test "$architecture" = x86_64
+          shasum -a 256 "${images[0]}" | tee SHA256SUMS
+
+      - name: Upload the verified DMG
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: DSH-macOS-x64-${{ inputs.upstream_tag }}
+          path: |
+            apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/*-mac-x64-unsigned.dmg
+            apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts/SHA256SUMS
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
